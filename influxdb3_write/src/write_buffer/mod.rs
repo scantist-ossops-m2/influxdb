@@ -544,7 +544,7 @@ fn validate_and_update_schema(line: &ParsedLine<'_>, schema: &mut Cow<'_, Databa
             }
 
             columns.insert(TIME_COLUMN_NAME.to_string(), ColumnType::Time as i16);
-            columns.insert(SERIES_ID_COLUMN_NAME.to_string(), ColumnType::String as i16);
+//            columns.insert(SERIES_ID_COLUMN_NAME.to_string(), ColumnType::String as i16);
 
             let table = TableDefinition::new(table_name, columns);
 
@@ -573,12 +573,12 @@ fn validate_and_convert_parsed_line<'a>(
     let mut values = Vec::with_capacity(line.column_count() + 1);
 
     // generate _series_id from tag set
-    let series_id = hash_series_id(raw_line, &mut line.series);
-    let value = Field {
-        name: SERIES_ID_COLUMN_NAME.to_string(),
-        value: FieldData::String(series_id.to_string()),
-    };
-    values.push(value);
+    // let series_id = hash_series_id(raw_line, &mut line.series);
+    // let value = Field {
+    //     name: SERIES_ID_COLUMN_NAME.to_string(),
+    //     value: FieldData::String(series_id.to_string()),
+    // };
+    // values.push(value);
 
     // validate tags, collecting any new ones that must be inserted, or adding the values
     if let Some(tag_set) = line.series.tag_set {

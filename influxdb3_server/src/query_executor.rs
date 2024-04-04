@@ -41,6 +41,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
+use datafusion::logical_expr::TableProviderFilterPushDown;
 use trace::ctx::SpanContext;
 use trace::span::{Span, SpanExt, SpanRecorder};
 use trace_http::ctx::RequestLogContext;
@@ -466,6 +467,16 @@ impl<B: WriteBuffer> TableProvider for QueryTable<B> {
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> datafusion::common::Result<Vec<TableProviderFilterPushDown>> {
+        filters
+            .iter()
+            .map(|f| Ok(TableProviderFilterPushDown::Inexact))
+            .collect()
     }
 
     async fn scan(

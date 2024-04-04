@@ -10,8 +10,8 @@ use crate::{
 };
 #[cfg(test)]
 use arrow::record_batch::RecordBatch;
-use data_types::{ChunkId, ChunkOrder, TableId, TransitionPartitionId};
-use datafusion::common::DataFusionError;
+use data_types::{ChunkId, ChunkOrder, TableId, TimestampMinMax, TransitionPartitionId};
+use datafusion::common::{DataFusionError, ScalarValue};
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::Expr;
 use iox_query::chunk_statistics::create_chunk_statistics;
@@ -24,6 +24,7 @@ use schema::Schema;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
+use schema::Projection;
 use tokio::sync::watch;
 
 // The maximum number of open segments that can be open at any one time. Each one of these will
@@ -112,8 +113,8 @@ impl<T: TimeProvider, W: Wal> SegmentState<T, W> {
         &self,
         db_schema: Arc<DatabaseSchema>,
         table_name: &str,
-        _filters: &[Expr],
-        _projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        projection: Option<&Vec<usize>>,
         _ctx: &SessionState,
     ) -> Result<Vec<Arc<dyn QueryChunk>>, DataFusionError> {
         let table = db_schema
@@ -123,9 +124,41 @@ impl<T: TimeProvider, W: Wal> SegmentState<T, W> {
         let schema = table.schema.clone();
 
         let mut chunks: Vec<Arc<dyn QueryChunk>> = vec![];
+        let (series_id, time_range) = get_series_id_and_time_from_exprs(filters);
 
         for segment in self.segments.values() {
-            if let Some(batches) =
+            if let Some(series_id) = &series_id {
+                if let Some(batch) = segment.table_record_batch_for_series(&db_schema.name, table_name, &schema, projection, series_id) {
+                    let schema = projection.map(|p| {
+                        schema.select_by_indices(p)
+                    }).unwrap_or(schema.clone());
+
+                    let chunk_stats = create_chunk_statistics(
+                        Some(batch.num_rows()),
+                        &schema,
+                        Some(segment.segment_range().timestamp_min_max()),
+                        None,
+                    );
+
+                    chunks.push(Arc::new(BufferChunk {
+                        batches: vec![batch],
+                        schema,
+                        stats: Arc::new(chunk_stats),
+                        partition_id: TransitionPartitionId::new(
+                            TableId::new(0),
+                            segment.segment_key(),
+                        ),
+                        sort_key: None,
+                        id: ChunkId::new(),
+                        chunk_order: ChunkOrder::new(
+                            chunks
+                                .len()
+                                .try_into()
+                                .expect("should never have this many chunks"),
+                        ),
+                    }));
+                }
+            } else if let Some(batches) =
                 segment.table_record_batches(&db_schema.name, table_name, &schema)
             {
                 let row_count = batches.iter().map(|b| b.num_rows()).sum();
@@ -158,7 +191,38 @@ impl<T: TimeProvider, W: Wal> SegmentState<T, W> {
         }
 
         for persisting_segment in self.persisting_segments.values() {
-            if let Some(batches) = persisting_segment.buffered_data.table_record_batches(
+            if let Some(series_id) = &series_id {
+                if let Some(batch) = persisting_segment.buffered_data.table_record_batch_for_series(&db_schema.name, table_name, &schema, projection, series_id) {
+                    let schema = projection.map(|p| {
+                        schema.select_by_indices(p)
+                    }).unwrap_or(schema.clone());
+
+                    let chunk_stats = create_chunk_statistics(
+                        Some(batch.num_rows()),
+                        &schema,
+                        Some(persisting_segment.segment_range.timestamp_min_max()),
+                        None,
+                    );
+
+                    chunks.push(Arc::new(BufferChunk {
+                        batches: vec![batch],
+                        schema: schema.clone(),
+                        stats: Arc::new(chunk_stats),
+                        partition_id: TransitionPartitionId::new(
+                            TableId::new(0),
+                            &persisting_segment.segment_key,
+                        ),
+                        sort_key: None,
+                        id: ChunkId::new(),
+                        chunk_order: ChunkOrder::new(
+                            chunks
+                                .len()
+                                .try_into()
+                                .expect("should never have this many chunks"),
+                        ),
+                    }));
+                }
+            } else if let Some(batches) = persisting_segment.buffered_data.table_record_batches(
                 &db_schema.name,
                 table_name,
                 &schema,
@@ -444,6 +508,55 @@ where
     }
 
     Ok(())
+}
+
+fn get_series_id_and_time_from_exprs(filter: &[Expr]) -> (Option<String>, TimestampMinMax)  {
+    let mut series_id = None;
+    let mut time_min = i64::MIN;
+    let mut time_max = i64::MAX;
+    println!("get_series_id_and_time_from_exprs: filter: {:?}", filter);
+
+    for expr in filter {
+        println!("expr: {:?}", expr);
+        if let Expr::BinaryExpr(b) = expr {
+            if let Expr::Column(c) = b.left.as_ref() {
+                if c.name == "series_id" {
+                    println!("series_id: {:?}", b.right.as_ref());
+                    if b.op == datafusion::logical_expr::Operator::Eq {
+                        if let Expr::Literal(ScalarValue::Utf8(Some(value))) = b.right.as_ref() {
+                            println!("series_id: {:?}", value);
+                            series_id = Some(value.clone());
+                        } else if let Expr::Literal(ScalarValue::Dictionary(_, v)) = b.right.as_ref() {
+                            println!("in dictionary series_id!");
+                            if let ScalarValue::Utf8(Some(val)) = v.as_ref() {
+                                series_id = Some(val.clone());
+                            }
+                        }
+                    }
+                } else if c.name == "time" {
+                    if let Expr::Literal(ScalarValue::TimestampNanosecond(Some(t), _)) = b.right.as_ref() {
+                        match b.op {
+                            datafusion::logical_expr::Operator::GtEq => {
+                                time_min = *t;
+                            },
+                            datafusion::logical_expr::Operator::Gt => {
+                                time_min = *t + 1;
+                            },
+                            datafusion::logical_expr::Operator::LtEq => {
+                                time_max = *t;
+                            },
+                            datafusion::logical_expr::Operator::Lt => {
+                                time_max = *t - 1;
+                            },
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (series_id, TimestampMinMax::new(time_min, time_max))
 }
 
 #[cfg(test)]
