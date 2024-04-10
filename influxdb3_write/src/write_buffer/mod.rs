@@ -10,6 +10,9 @@ use crate::catalog::{
     Catalog, DatabaseSchema, TableDefinition, SERIES_ID_COLUMN_NAME, TIME_COLUMN_NAME,
 };
 use crate::chunk::ParquetChunk;
+use crate::paths::ParquetFilePath;
+use crate::persister::serialize_to_parquet;
+use crate::persister::ParquetBytes;
 use crate::write_buffer::flusher::WriteBufferFlusher;
 use crate::write_buffer::loader::load_starting_state;
 use crate::write_buffer::segment_state::{run_buffer_segment_persist_and_cleanup, SegmentState};
@@ -19,12 +22,17 @@ use crate::{
     Precision, SegmentDuration, SegmentId, SequenceNumber, Wal, WalOp, WriteBuffer, WriteLineError,
 };
 use async_trait::async_trait;
+use chrono::DateTime;
+use chrono::Utc;
 use data_types::{
     column_type_from_field, ChunkId, ChunkOrder, ColumnType, NamespaceName, NamespaceNameError,
 };
 use datafusion::common::DataFusionError;
 use datafusion::execution::context::SessionState;
+use datafusion::execution::memory_pool::MemoryPool;
+use datafusion::execution::memory_pool::UnboundedMemoryPool;
 use datafusion::logical_expr::Expr;
+use datafusion::physical_plan::SendableRecordBatchStream;
 use influxdb_line_protocol::{parse_lines, FieldValue, ParsedLine, Series, TagSet};
 use iox_query::chunk_statistics::create_chunk_statistics;
 use iox_query::QueryChunk;
@@ -94,6 +102,7 @@ pub struct WriteBufferImpl<W, T, P> {
     segment_state: Arc<RwLock<SegmentState<T, W>>>,
     parquet_cache: Arc<dyn ObjectStore>,
     parquet_cache_metadata: Arc<RwLock<DatabaseTables>>,
+    mem_pool: Arc<dyn MemoryPool>,
     persister: Arc<P>,
     wal: Option<Arc<W>>,
     write_buffer_flusher: WriteBufferFlusher,
@@ -161,6 +170,7 @@ impl<W: Wal, T: TimeProvider, P: Persister> WriteBufferImpl<W, T, P> {
             parquet_cache_metadata: Arc::new(RwLock::new(DatabaseTables {
                 tables: HashMap::new(),
             })),
+            mem_pool: Arc::new(UnboundedMemoryPool::default()),
             persister,
             wal,
             write_buffer_flusher,
@@ -340,6 +350,25 @@ impl<W: Wal, T: TimeProvider, P: Persister> WriteBufferImpl<W, T, P> {
         }
 
         Ok(chunks)
+    }
+
+    async fn persist_parquet_cache(
+        &self,
+        db_name: &str,
+        table_name: &str,
+        date: DateTime<Utc>,
+        file_number: u32,
+        batches: SendableRecordBatchStream,
+    ) -> Result<(), Error> {
+        let ParquetBytes { bytes, meta_data } =
+            serialize_to_parquet(Arc::clone(&self.mem_pool), batches).await?;
+        let path = ParquetFilePath::new(db_name, table_name, date, file_number);
+        self.parquet_cache.put(&path, bytes).await.unwrap();
+        Ok(())
+    }
+
+    fn get_parquet_cache(path: ParquetFilePath) -> Result<Vec<u8>, Error> {
+        todo!()
     }
 
     #[cfg(test)]
